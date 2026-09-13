@@ -11,8 +11,21 @@ let frameRate = try await video.load(.nominalFrameRate)
 let audioTracks = try await asset.loadTracks(withMediaType: .audio)
 precondition(abs(videoDuration.seconds - 9) < 0.02)
 precondition(size == CGSize(width: 1600, height: 1000))
-precondition(frameRate == 60)
+// AVFoundation may report 60.000004 after H.264 timebase conversion.
+precondition(abs(frameRate - 60) < 0.001)
 precondition(audioTracks.isEmpty)
+let reader = try AVAssetReader(asset: asset)
+let output = AVAssetReaderTrackOutput(track: video, outputSettings: nil)
+reader.add(output)
+precondition(reader.startReading())
+var timestamps: [Double] = []
+while let sample = output.copyNextSampleBuffer() {
+    timestamps.append(CMSampleBufferGetPresentationTimeStamp(sample).seconds)
+}
+precondition(reader.status == .completed && timestamps.count == 540)
+for (frame, time) in timestamps.sorted().enumerated() {
+    precondition(abs(time - Double(frame) / 60) < 0.001)
+}
 let generator = AVAssetImageGenerator(asset: asset)
 let first = try await generator.image(at: .zero).image
 try NSBitmapImageRep(cgImage: first).representation(using: .png, properties: [:])!.write(to: folder.appendingPathComponent("video-decoded.png"))

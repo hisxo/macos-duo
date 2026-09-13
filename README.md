@@ -84,7 +84,7 @@ Test output stays in ignored `build/validation/`. AppKit view snapshots omit the
 
 ## Promotional animation
 
-`docs/media/` contains a seamless 9-second showcase: an 800×500 GIF at 20 fps for embedding, a 1600×1000 H.264 MP4 at 60 fps for social posts, and a PNG cover. Use the MP4 for the smoothest result. These are original synthetic visuals, not a recording of a user's desktop. The laptop illustration stays open while the actual Metal effect responds to a simulated lid angle.
+`docs/media/` contains a seamless 9-second showcase: an 800×500 GIF at 20 fps for embedding, a 1600×1000 H.264 MP4 at 60 fps for social posts, and a PNG cover. Use the MP4 for the smoothest result. These are original synthetic visuals, not a recording of a user's desktop. The laptop lid physically pivots around its hinge, closes onto the keyboard, and reopens; perspective and the app's actual Metal effect follow the same simulated angle.
 
 Reproduce it with `bash Tools/build-promo.sh build/promo-new`. The output directory must not already contain an MP4; the tool refuses to overwrite previous exports. This uses native AppKit, Metal and AVFoundation, without third-party packages or screen-recording permission.
 

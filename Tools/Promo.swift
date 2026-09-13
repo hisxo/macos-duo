@@ -4,10 +4,12 @@ import AVFoundation
 import ImageIO
 import MetalKit
 import UniformTypeIdentifiers
+import CoreImage
 
 @main
 enum Promo {
     static let width = 1600, height = 1000, fps = 60, frames = 540
+    static let imageContext = CIContext(options: [.cacheIntermediates: false])
     static func color(_ r: CGFloat, _ g: CGFloat, _ b: CGFloat, _ a: CGFloat = 1) -> NSColor {
         NSColor(srgbRed: r, green: g, blue: b, alpha: a)
     }
@@ -57,10 +59,77 @@ enum Promo {
     }
     static func angle(_ time: Double) -> Double {
         if time < 0.8 { return 110 }
-        if time < 4.2 { return 110 - 105 * smooth((time - 0.8) / 3.4) }
-        if time < 4.6 { return 5 }
-        if time < 8.2 { return 5 + 105 * smooth((time - 4.6) / 3.6) }
+        if time < 4.2 { return 110 - 110 * smooth((time - 0.8) / 3.4) }
+        if time < 4.6 { return 0 }
+        if time < 8.2 { return 110 * smooth((time - 4.6) / 3.6) }
         return 110
+    }
+    // A pinhole camera above the desk. Both base and lid use the same world
+    // coordinates; the lid rotates about a fixed, horizontal hinge.
+    static func project(_ x: Double, _ forward: Double, _ up: Double) -> CGPoint {
+        let elevation = 8.0 * Double.pi / 180
+        let depth = forward * cos(elevation) + up * sin(elevation)
+        let scale = 3500 / (3500 - depth)
+        return CGPoint(x: 800 + x * scale, y: 225 + (up * cos(elevation) - forward * sin(elevation)) * scale)
+    }
+    static func laptop(_ c: CGContext, screen: CGImage, angle: Double) {
+        let rearLeft = project(-459, 0, 0), rearRight = project(459, 0, 0)
+        let frontLeft = project(-459, 575, 0), frontRight = project(459, 575, 0)
+        let base = CGMutablePath()
+        base.move(to: rearLeft); base.addLine(to: rearRight); base.addLine(to: frontRight)
+        base.addLine(to: CGPoint(x: frontRight.x - 12, y: frontRight.y - 9))
+        base.addLine(to: CGPoint(x: frontLeft.x + 12, y: frontLeft.y - 9)); base.addLine(to: frontLeft); base.closeSubpath()
+        c.saveGState()
+        c.setShadow(offset: CGSize(width: 0, height: -16), blur: 36, color: color(0, 0, 0, 0.75).cgColor)
+        c.addPath(base); c.setFillColor(color(0.38, 0.37, 0.40).cgColor); c.fillPath(); c.restoreGState()
+        c.saveGState(); c.addPath(base); c.clip()
+        let baseMetal = CGGradient(colorsSpace: c.colorSpace, colors: [color(0.19, 0.18, 0.22).cgColor, color(0.46, 0.44, 0.48).cgColor] as CFArray, locations: [0, 1])!
+        c.drawLinearGradient(baseMetal, start: CGPoint(x: 800, y: frontLeft.y - 9), end: CGPoint(x: 800, y: rearLeft.y), options: [])
+        c.restoreGState()
+        // Keyboard and trackpad are attached to the stationary base plane.
+        for row in 0..<5 {
+            for column in 0..<14 {
+                let x = -393.0 + Double(column) * 57
+                let f = 65.0 + Double(row) * 52
+                let points = [project(x, f, 0.5), project(x + 47, f, 0.5), project(x + 47, f + 40, 0.5), project(x, f + 40, 0.5)]
+                c.beginPath(); c.move(to: points[0]); points.dropFirst().forEach { c.addLine(to: $0) }; c.closePath()
+                c.setFillColor(color(0.075, 0.075, 0.09).cgColor); c.fillPath()
+            }
+        }
+        let trackpad = [project(-120, 365, 0.5), project(120, 365, 0.5), project(120, 520, 0.5), project(-120, 520, 0.5)]
+        c.beginPath(); c.move(to: trackpad[0]); trackpad.dropFirst().forEach { c.addLine(to: $0) }; c.closePath()
+        c.setStrokeColor(color(0.20, 0.19, 0.22).cgColor); c.setLineWidth(1); c.strokePath()
+        let radians = angle * Double.pi / 180
+        let topLeft = project(-459, 575 * cos(radians), 575 * sin(radians))
+        let topRight = project(459, 575 * cos(radians), 575 * sin(radians))
+        // Below the camera elevation, the viewer sees the outside of the lid.
+        let exterior = angle < 8
+        let lid = context(918, 575), rect = CGRect(x: 0, y: 0, width: 918, height: 575)
+        rounded(lid, rect, 22, color(0.48, 0.46, 0.49))
+        if exterior {
+            let aluminum = CGGradient(colorsSpace: lid.colorSpace, colors: [color(0.23, 0.22, 0.26).cgColor, color(0.47, 0.45, 0.49).cgColor] as CFArray, locations: [0, 1])!
+            lid.saveGState(); lid.addPath(CGPath(roundedRect: rect.insetBy(dx: 2, dy: 2), cornerWidth: 21, cornerHeight: 21, transform: nil)); lid.clip()
+            lid.drawLinearGradient(aluminum, start: .zero, end: CGPoint(x: 900, y: 575), options: []); lid.restoreGState()
+        } else {
+            rounded(lid, rect.insetBy(dx: 2, dy: 2), 20, color(0.035, 0.035, 0.045))
+            lid.saveGState()
+            let display = rect.insetBy(dx: 12, dy: 12)
+            lid.addPath(CGPath(roundedRect: display, cornerWidth: 12, cornerHeight: 12, transform: nil)); lid.clip()
+            lid.draw(screen, in: display); lid.restoreGState()
+            rounded(lid, CGRect(x: 415, y: 555, width: 88, height: 12), 5, color(0.025, 0.025, 0.03))
+        }
+        if abs(topLeft.y - rearLeft.y) > 0.5 {
+            let warped = CIImage(cgImage: lid.makeImage()!).applyingFilter("CIPerspectiveTransform", parameters: [
+                "inputTopLeft": CIVector(cgPoint: topLeft), "inputTopRight": CIVector(cgPoint: topRight),
+                "inputBottomLeft": CIVector(cgPoint: rearLeft), "inputBottomRight": CIVector(cgPoint: rearRight)])
+            let extent = warped.extent.integral
+            if let image = imageContext.createCGImage(warped, from: extent) { c.draw(image, in: extent) }
+        }
+        // A thin physical edge remains visible even at the edge-on crossing.
+        if abs(topLeft.y - rearLeft.y) < 2 || exterior {
+            c.move(to: topLeft); c.addLine(to: topRight)
+            c.setStrokeColor(color(0.58, 0.55, 0.60).cgColor); c.setLineWidth(2); c.strokePath()
+        }
     }
     static func compose(_ screen: CGImage, _ time: Double) -> CGImage {
         let c = context(width, height)
@@ -76,31 +145,7 @@ enum Promo {
         text("A frosted-glass transition, moved by your lid.", 110, 777, 23, .regular, color(0.63, 0.60, 0.66))
         rounded(c, CGRect(x: 1285, y: 891, width: 205, height: 42), 21, color(1, 0.77, 0.66, 0.08))
         text("NATIVE  /  METAL", 1310, 904, 14, .medium, peach)
-        let device = CGRect(x: 341, y: 188, width: 918, height: 575)
-        // Small breathing motion; the screen content itself uses the app's shader.
-        let lift = 3 * sin(time / 9 * .pi * 2)
-        c.saveGState(); c.translateBy(x: 0, y: lift)
-        c.saveGState()
-        c.setShadow(offset: CGSize(width: 0, height: -28), blur: 70, color: color(0, 0, 0, 0.7).cgColor)
-        rounded(c, device, 26, color(0.29, 0.27, 0.29))
-        c.restoreGState()
-        rounded(c, device.insetBy(dx: 2, dy: 2), 24, color(0.04, 0.04, 0.045))
-        c.saveGState()
-        let display = device.insetBy(dx: 12, dy: 12)
-        c.addPath(CGPath(roundedRect: display, cornerWidth: 15, cornerHeight: 15, transform: nil)); c.clip()
-        c.draw(screen, in: display)
-        c.restoreGState()
-        rounded(c, CGRect(x: 756, y: 741, width: 88, height: 12), 5, color(0.025, 0.025, 0.03))
-        let base = CGMutablePath()
-        base.move(to: CGPoint(x: 341, y: 189)); base.addLine(to: CGPoint(x: 1259, y: 189))
-        base.addLine(to: CGPoint(x: 1362, y: 164)); base.addQuadCurve(to: CGPoint(x: 1335, y: 152), control: CGPoint(x: 1358, y: 152))
-        base.addLine(to: CGPoint(x: 265, y: 152)); base.addQuadCurve(to: CGPoint(x: 238, y: 164), control: CGPoint(x: 242, y: 152)); base.closeSubpath()
-        c.saveGState(); c.addPath(base); c.clip()
-        let metal = CGGradient(colorsSpace: c.colorSpace, colors: [color(0.15, 0.15, 0.17).cgColor, color(0.56, 0.54, 0.56).cgColor] as CFArray, locations: [0, 1])!
-        c.drawLinearGradient(metal, start: CGPoint(x: 0, y: 152), end: CGPoint(x: 0, y: 189), options: [])
-        c.restoreGState()
-        rounded(c, CGRect(x: 734, y: 177, width: 132, height: 12), 6, color(0.15, 0.14, 0.17))
-        c.restoreGState()
+        laptop(c, screen: screen, angle: angle(time))
         let a = angle(time)
         let state = time < 0.8 || time >= 8.2 ? "AT REST" : time < 4.2 ? "CLOSING" : time < 4.6 ? "CLOSED" : "OPENING"
         text(state, 108, 87, 14, .medium, peach)
@@ -114,6 +159,8 @@ enum Promo {
     }
     static func main() throws {
         NSApplication.shared.setActivationPolicy(.prohibited)
+        precondition(angle(0) == angle(Double(frames - 1) / Double(fps)))
+        precondition(angle(4.3) == 0 && angle(0) == 110)
         let folder = URL(fileURLWithPath: CommandLine.arguments.dropFirst().first ?? "build/promo")
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         let movie = folder.appendingPathComponent("macos-duo.mp4")
