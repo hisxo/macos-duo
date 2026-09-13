@@ -15,7 +15,9 @@ precondition(size == CGSize(width: 1600, height: 1000))
 precondition(abs(frameRate - 60) < 0.001)
 precondition(audioTracks.isEmpty)
 let reader = try AVAssetReader(asset: asset)
-let output = AVAssetReaderTrackOutput(track: video, outputSettings: nil)
+// Decode frames: compressed passthrough includes empty H.264 dependency/edit
+// markers and decode-time offsets that are not displayed video frames.
+let output = AVAssetReaderTrackOutput(track: video, outputSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA])
 reader.add(output)
 precondition(reader.startReading())
 var timestamps: [Double] = []
