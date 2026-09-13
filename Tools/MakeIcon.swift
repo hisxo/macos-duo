@@ -5,9 +5,15 @@ try FileManager.default.createDirectory(at: output, withIntermediateDirectories:
 for size in [16, 32, 128, 256, 512] {
     for scale in [1, 2] {
         let pixels = size * scale
-        let image = NSImage(size: NSSize(width: pixels, height: pixels))
-        image.lockFocus()
+        // lockFocus() uses the current display's backing scale and doubles the
+        // pixels on Retina. An explicit bitmap keeps every ICNS slot exact.
+        let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: pixels, pixelsHigh: pixels,
+                                   bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                                   isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: pixels * 4, bitsPerPixel: 32)!
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
         let context = NSGraphicsContext.current!.cgContext
+        context.clear(CGRect(x: 0, y: 0, width: pixels, height: pixels))
         context.scaleBy(x: CGFloat(pixels) / 1024, y: CGFloat(pixels) / 1024)
         let background = NSBezierPath(roundedRect: NSRect(x: 40, y: 40, width: 944, height: 944), xRadius: 214, yRadius: 214)
         NSGradient(starting: NSColor(calibratedRed: 0.20, green: 0.21, blue: 0.30, alpha: 1), ending: NSColor(calibratedRed: 0.06, green: 0.07, blue: 0.11, alpha: 1))!.draw(in: background, angle: -60)
@@ -22,8 +28,8 @@ for size in [16, 32, 128, 256, 512] {
         NSColor(calibratedWhite: 1, alpha: 0.55).setStroke()
         front.lineWidth = 6
         front.stroke()
-        image.unlockFocus()
-        let rep = NSBitmapImageRep(data: image.tiffRepresentation!)!
+        NSGraphicsContext.restoreGraphicsState()
+        precondition(rep.pixelsWide == pixels && rep.pixelsHigh == pixels)
         let suffix = scale == 2 ? "@2x" : ""
         try rep.representation(using: .png, properties: [:])!.write(to: output.appendingPathComponent("icon_\(size)x\(size)\(suffix).png"))
     }

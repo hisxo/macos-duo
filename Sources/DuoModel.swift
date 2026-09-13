@@ -56,21 +56,22 @@ final class DuoModel: ObservableObject {
     @Published var captureStatus = "capture.choose"
     @Published var captureDetail = ""
     @Published var checkingCapture = false
+    @Published var awaitingCaptureRestart = false
+    @Published var restarting = false
     @Published var captureVerified = false
     @Published var previewRevision = 0
-    private let screenPicker = ScreenPicker()
-    private var selectedFilter: SCContentFilter?
     private var motionTimer: Timer?
     private var lastMotionTime = CACurrentMediaTime()
     private var overlayStarted = CACurrentMediaTime()
-    private var captureRetryAfter = 0.0
     let previewRenderer: FoldRenderer
     let overlayRenderer: FoldRenderer
     private let sensor = LidSensor()
     private var panel: NSPanel?
     private var overlayView: MTKView?
     private var demoTimer: Timer?
-    private var permissionTimer: Timer?
+    private var verificationGeneration = 0
+    private var accessProbe: () -> Bool = { CGPreflightScreenCaptureAccess() }
+    private var captureOverride: (@MainActor (NSScreen) async throws -> CGImage)?
     private var observers: [NSObjectProtocol] = []
     private var keyMonitor: Any?
     private let escapeKey = EscapeKey()
@@ -99,12 +100,6 @@ final class DuoModel: ObservableObject {
             guard self.enabled, !self.suspended, !self.fullScreenDemo, !self.suppressedUntilOpen else { return }
             self.target = self.effectProgress(reading)
         }
-        screenPicker.selected = { [weak self] filter in
-            guard let self else { return }
-            self.selectedFilter = filter
-            self.verifyCapture()
-        }
-        screenPicker.failed = { [weak self] key, detail in self?.captureStatus = key; self?.captureDetail = detail }
         motionTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self else { return }
@@ -119,12 +114,11 @@ final class DuoModel: ObservableObject {
         }
         if !CommandLine.arguments.contains("--integration-test") { sensor.start() }
         escapeKey.action = { [weak self] in self?.escape() }
-        permissionTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+        observers.append(NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated {
-                let granted = CGPreflightScreenCaptureAccess()
-                if self?.permission != granted { self?.permission = granted }
+                if !CommandLine.arguments.contains("--integration-test") { self?.refreshCaptureAccess() }
             }
-        }
+        })
         watchdog = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self else { return }
@@ -162,7 +156,19 @@ final class DuoModel: ObservableObject {
     func t(_ key: String) -> String { Localization.text(key, language: language) }
     var locale: Locale { Locale(identifier: language.resolved()) }
     var localizedMessage: String { t(message) + (messageDetail.isEmpty ? "" : " " + messageDetail) }
-    var localizedCaptureStatus: String { t(captureStatus) + (captureDetail.isEmpty ? "" : " " + captureDetail) }
+    var localizedCaptureStatus: String { t(checkingCapture ? "capture.checking" : captureStatus) }
+    var captureActionLabel: String {
+        if restarting { return t("capture.restarting") }
+        if checkingCapture { return t("Checking…") }
+        if awaitingCaptureRestart { return t("capture.restart") }
+        return t(captureVerified ? "Test effect" : "capture.authorize")
+    }
+    func captureAction() {
+        guard !checkingCapture && !restarting else { return }
+        if awaitingCaptureRestart { restartApplication() }
+        else if captureVerified { play(fullScreen: true) }
+        else { requestPermission() }
+    }
     func effectProgress(_ angle: Double) -> Double {
         lidProgress(angle: angle, closingStart: threshold, backwardStart: backwardStart, backwardEnd: backwardEnd, backwardStrength: backwardStrength)
     }
@@ -174,48 +180,95 @@ final class DuoModel: ObservableObject {
     var sensorLabel: String { angle.map { "\(t("sensor.connected")) · \(Int($0))°" } ?? t("sensor.unavailable") }
 
     func requestPermission() {
-        stopDemo(); dismissOverlay()
-        captureStatus = "capture.confirm"; captureDetail = ""
-        screenPicker.present()
+        invalidateCapture()
+        awaitingCaptureRestart = true
+        captureStatus = "capture.settings"
+        // This is the only permission request, and it requires an explicit click.
+        CGRequestScreenCaptureAccess()
+        openCaptureSettings()
     }
 
     func openCaptureSettings() {
-        CGRequestScreenCaptureAccess()
         NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
         captureStatus = "capture.settings"; captureDetail = ""
     }
 
+    func restartApplication() {
+        guard !restarting else { return }
+        restarting = true
+        stopDemo(); dismissOverlay()
+        let helper = Process()
+        helper.executableURL = URL(fileURLWithPath: "/bin/sh")
+        // The path is a positional argument, never interpolated into shell code.
+        // Wait for this process to exit before opening the exact same app copy.
+        helper.arguments = ["-c", "n=0; while kill -0 \"$2\" 2>/dev/null; do n=$((n+1)); [ \"$n\" -lt 100 ] || exit 1; sleep 0.1; done; exec /usr/bin/open \"$1\"", "duo-relaunch", Bundle.main.bundleURL.path, String(ProcessInfo.processInfo.processIdentifier)]
+        do { try helper.run(); NSApp.terminate(nil) }
+        catch {
+            restarting = false
+            captureStatus = "capture.restartFailed"; captureDetail = error.localizedDescription
+        }
+    }
+
+    func refreshCaptureAccess() {
+        guard !awaitingCaptureRestart else { return }
+        let wasGranted = permission
+        permission = accessProbe()
+        if !permission && wasGranted {
+            invalidateCapture()
+        }
+        if permission && !captureVerified && !checkingCapture && (!wasGranted || captureStatus == "capture.choose") {
+            verifyCapture()
+        }
+    }
+
+    private func invalidateCapture() {
+        verificationGeneration += 1
+        checkingCapture = false
+        captureVerified = false
+        stopDemo(); dismissOverlay()
+        captureStatus = "capture.required"; captureDetail = ""
+    }
+
     func verifyCapture() {
-        guard !checkingCapture else { return }
+        guard !checkingCapture && !awaitingCaptureRestart else { return }
+        permission = accessProbe()
+        guard permission else {
+            captureVerified = false
+            captureStatus = "capture.required"; captureDetail = ""
+            return
+        }
+        stopDemo(); dismissOverlay()
+        verificationGeneration += 1
+        let generation = verificationGeneration
         checkingCapture = true
         Task {
-            defer { checkingCapture = false }
+            defer { if generation == verificationGeneration { checkingCapture = false } }
             do {
-                guard let screen = builtInScreen ?? NSScreen.main else { return }
+                guard let screen = builtInScreen ?? NSScreen.main else {
+                    throw NSError(domain: "Duo", code: 3, userInfo: [NSLocalizedDescriptionKey: t("display.missing")])
+                }
                 let image = try await captureDesktop(screen: screen)
+                guard generation == verificationGeneration else { return }
                 try previewRenderer.setImage(image)
                 previewRevision += 1
                 captureVerified = true
-                captureRetryAfter = 0
                 captureStatus = "capture.verified"; captureDetail = ""
             } catch {
-                captureVerified = false
+                guard generation == verificationGeneration else { return }
+                invalidateCapture()
                 captureStatus = "capture.failed"; captureDetail = error.localizedDescription
             }
         }
     }
 
     private func captureDesktop(screen: NSScreen) async throws -> CGImage {
-        let filter: SCContentFilter
-        if let selectedFilter { filter = selectedFilter }
-        else {
-            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-            let id = (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
-            guard let display = content.displays.first(where: { $0.displayID == id }) else {
-                throw NSError(domain: "Duo", code: 3, userInfo: [NSLocalizedDescriptionKey: t("display.missing")])
-            }
-            filter = SCContentFilter(display: display, excludingWindows: [])
+        if let captureOverride { return try await captureOverride(screen) }
+        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+        let id = (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
+        guard let display = content.displays.first(where: { $0.displayID == id }) else {
+            throw NSError(domain: "Duo", code: 3, userInfo: [NSLocalizedDescriptionKey: t("display.missing")])
         }
+        let filter = SCContentFilter(display: display, excludingWindows: [])
         let config = SCStreamConfiguration()
         config.width = Int(screen.frame.width * screen.backingScaleFactor)
         config.height = Int(screen.frame.height * screen.backingScaleFactor)
@@ -252,7 +305,7 @@ final class DuoModel: ObservableObject {
     }
 
     func play(fullScreen: Bool = false) {
-        if fullScreen && !permission && selectedFilter == nil && !CommandLine.arguments.contains("--integration-test") {
+        if fullScreen && !captureVerified && !CommandLine.arguments.contains("--integration-test") {
             captureStatus = "capture.required"; captureDetail = ""
             message = captureStatus
             return
@@ -314,6 +367,7 @@ final class DuoModel: ObservableObject {
     }
 
     private func showOverlay(progress: Double) {
+        guard !checkingCapture && !awaitingCaptureRestart else { return }
         // Fade the optical transformation in after capture becomes available.
         // The panel itself starts transparent to avoid a black first drawable.
         let entry = min(1, max(0, (CACurrentMediaTime() - overlayStarted) / 0.32))
@@ -328,8 +382,7 @@ final class DuoModel: ObservableObject {
             overlayView.setNeedsDisplay(overlayView.bounds); return
         }
         let artworkTest = CommandLine.arguments.contains("--integration-test")
-        guard artworkTest || permission || selectedFilter != nil else { return }
-        guard CACurrentMediaTime() >= captureRetryAfter else { return }
+        guard artworkTest || captureVerified else { return }
         guard !capturePending, let screen = builtInScreen ?? (fullScreenDemo ? NSScreen.main : nil) else { return }
         capturePending = true
         captureGeneration += 1
@@ -341,9 +394,7 @@ final class DuoModel: ObservableObject {
                     captured = try await captureDesktop(screen: screen)
                 } catch {
                     guard generation == captureGeneration else { return }
-                    capturePending = false
-                    captureRetryAfter = CACurrentMediaTime() + 5
-                    captureVerified = false
+                    invalidateCapture()
                     captureStatus = "capture.failed"; captureDetail = error.localizedDescription
                     return
                 }
@@ -383,6 +434,54 @@ final class DuoModel: ObservableObject {
     }
 
     func integrationTest() async throws {
+        let savedProbe = accessProbe
+        defer { accessProbe = savedProbe; captureOverride = nil }
+        accessProbe = { false }
+        var attempts = 0
+        captureOverride = { _ in attempts += 1; return FoldRenderer.artwork() }
+        awaitingCaptureRestart = true
+        try SelfTest.require(captureActionLabel == t("capture.restart"), "Setup must offer exactly one restart action")
+        refreshCaptureAccess()
+        verifyCapture()
+        try SelfTest.require(attempts == 0 && !checkingCapture, "Setup must not capture before restart")
+        awaitingCaptureRestart = false
+        try SelfTest.require(captureActionLabel == t("capture.authorize"), "Fresh process must offer authorization until verified")
+        verifyCapture()
+        try await Task.sleep(nanoseconds: 50_000_000)
+        try SelfTest.require(attempts == 0 && !captureVerified, "Denied access must not trigger a capture or permission dialog")
+        accessProbe = { true }
+        refreshCaptureAccess()
+        try await Task.sleep(nanoseconds: 300_000_000)
+        try SelfTest.require(attempts == 1 && captureVerified && !checkingCapture, "Returning after permission grant must verify a real image")
+        try SelfTest.require(captureActionLabel == t("Test effect"), "Only a verified capture may enable the desktop test")
+        accessProbe = { false }
+        refreshCaptureAccess()
+        try SelfTest.require(!captureVerified, "Revoking persistent access must disable capture")
+        accessProbe = { true }
+        captureOverride = { _ in attempts += 1; throw NSError(domain: "CaptureTest", code: 1) }
+        verifyCapture()
+        try await Task.sleep(nanoseconds: 50_000_000)
+        let attemptsAfterFailure = attempts
+        refreshCaptureAccess()
+        try await Task.sleep(nanoseconds: 50_000_000)
+        try SelfTest.require(!captureVerified && attempts == attemptsAfterFailure, "Failed capture must not automatically retry on activation")
+        captureOverride = { _ in
+            try await Task.sleep(nanoseconds: 100_000_000)
+            return FoldRenderer.artwork()
+        }
+        verifyCapture()
+        invalidateCapture()
+        try await Task.sleep(nanoseconds: 200_000_000)
+        try SelfTest.require(!captureVerified && !checkingCapture, "Stale verification must not restore revoked access")
+        captureOverride = nil
+        print("PASS: capture workflow denied, granted, revoked, failed without retry, and stale success (injected capture transport)")
+        captureVerified = true
+        checkingCapture = true
+        let oldVerification = verificationGeneration
+        invalidateCapture()
+        try SelfTest.require(!captureVerified && !checkingCapture && verificationGeneration > oldVerification,
+                             "Capture invalidation must stop retries and cancel stale verification")
+        print("PASS: revoked/failed capture disables automatic retries and invalidates pending verification")
         let oldPermission = permission
         permission = false
         fullScreenDemo = true

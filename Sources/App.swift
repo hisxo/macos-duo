@@ -31,7 +31,9 @@ struct DuoApp: App {
                     if CommandLine.arguments.contains("--integration-test") {
                         do { try await model.integrationTest(); NSApp.terminate(nil) }
                         catch { fputs("FAIL: \(error)\n", stderr); exit(1) }
-                    }
+                    } else if CommandLine.arguments.contains("--restart-test") {
+                        model.restartApplication()
+                    } else { model.refreshCaptureAccess() }
                 }
         }
         .defaultSize(width: 1000, height: 720)
@@ -45,6 +47,12 @@ struct DuoApp: App {
 
 final class DuoDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Also load directly for copies opened before Launch Services has
+        // refreshed its cached icon (for example after replacing a local build).
+        if let url = Bundle.main.url(forResource: "Duo", withExtension: "icns"),
+           let icon = NSImage(contentsOf: url), icon.isValid {
+            NSApp.applicationIconImage = icon
+        }
         NSApp.activate(ignoringOtherApps: true)
         if CommandLine.arguments.contains("--ui-test") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
@@ -174,16 +182,14 @@ struct Dashboard: View {
                         HStack { Text(model.t("Your screen in motion")).font(.system(size: 14, weight: .medium)); Spacer(); Image(systemName: model.captureVerified ? "checkmark.shield" : "lock.shield").foregroundStyle(peach) }
                         Text(model.localizedCaptureStatus)
                             .font(.system(size: 11)).foregroundStyle(.secondary).lineSpacing(3).fixedSize(horizontal: false, vertical: true)
-                        HStack {
-                            Button(model.t("Choose my screen")) { model.requestPermission() }
-                                .buttonStyle(.borderedProminent).tint(peach).foregroundStyle(.black)
-                            Button(model.t(model.checkingCapture ? "Checking…" : "Verify")) { model.verifyCapture() }
-                                .disabled(model.checkingCapture)
+                        Button(model.captureActionLabel) { model.captureAction() }
+                            .buttonStyle(.borderedProminent).tint(peach).foregroundStyle(.black)
+                            .disabled(model.checkingCapture || model.restarting)
+                        if !model.captureDetail.isEmpty {
+                            DisclosureGroup(model.t("capture.details")) {
+                                Text(model.captureDetail).font(.system(size: 10)).textSelection(.enabled)
+                            }.font(.system(size: 11))
                         }
-                        HStack {
-                            Button(model.t("macOS Settings")) { model.openCaptureSettings() }
-                            Button(model.t("Test effect")) { model.play(fullScreen: true) }.disabled(!model.captureVerified)
-                        }.font(.system(size: 11))
                         Toggle(model.t("Preview follows physical lid"), isOn: $model.followLid).font(.system(size: 11)).disabled(model.angle == nil)
                     }.padding(18).frame(maxWidth: .infinity, alignment: .leading).background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 14))
                 }
